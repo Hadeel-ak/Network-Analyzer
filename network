@@ -1,0 +1,3 @@
+A lightweight Python Flask-based LAN Network Scanner designed to discover responsive devices and identify open TCP ports on a local IPv4 network.
+
+The application provides a simple web interface where users can enter a network range (CIDR) and select ports to scan. It checks each host for accessible TCP services and displays useful information such as the device IP address, hostname, IP class, and detected open ports.
