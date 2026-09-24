@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import ipaddress
+import json
+import socket
+import threading
+from datetime import datetime, timezone
+from typing import Any
+
+from flask import Flask, jsonify, render_template, request, send_file
+from io import BytesIO
+
+app = Flask(__name__)
+
+COMMON_PORTS = {
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    123: "NTP",
+    135: "MS RPC",
+    139: "NetBIOS",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    3389: "RDP",
+    5353: "mDNS",
+    8080: "HTTP Alt",
+}
+MAX_HOSTS = 256
+MAX_PORTS = 64
+SOCKET_TIMEOUT = 0.18
+scan_progress: dict[str, Any] = {
+    "active": False,
+    "checked": 0,
+    "total": 0,
+    "discovered": [],
+}
+scan_progress_lock = threading.Lock()
+
+
+def local_network() -> str:
+    """Return a useful private /24 fallback for the machine running the app."""
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+        address = ipaddress.ip_address(local_ip)
+        if not address.is_private:
+            raise ValueError("non-private address")
+        return str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    except (OSError, ValueError):
+        return "192.168.1.0/24"
+
+
+def ip_class(address: ipaddress.IPv4Address) -> str:
+    first_octet = int(str(address).split(".", 1)[0])
+    if first_octet < 128:
+        return "A"
+    if first_octet < 192:
+        return "B"
+    if first_octet < 224:
+        return "C"
+    if first_octet < 240:
+        return "D (multicast)"
+    return "E (reserved)"
+
+
+def parse_ports(raw_ports: str) -> list[int]:
+    values: set[int] = set()
+    for value in raw_ports.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            port = int(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid port: {value}") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Port must be between 1 and 65535: {port}")
+        values.add(port)
+    if not values:
+        raise ValueError("Enter at least one port")
+    if len(values) > MAX_PORTS:
+        raise ValueError(f"Choose no more than {MAX_PORTS} ports")
+    return sorted(values)
+
+
+def scan_host(address: ipaddress.IPv4Address, ports: list[int]) -> dict[str, Any]:
+    ip = str(address)
+    open_ports: list[dict[str, Any]] = []
+    for port in ports:
+        try:
+            with socket.create_connection((ip, port), timeout=SOCKET_TIMEOUT):
+                open_ports.append({
+                    "port": port,
+                    "protocol": COMMON_PORTS.get(port, "Unknown / TCP"),
+                    "transport": "TCP",
+                })
+        except (ConnectionRefusedError, TimeoutError, OSError):
+            continue
+
+    hostname = ""
+    if open_ports:
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+        except (socket.herror, socket.gaierror, OSError):
+            hostname = ""
+
+    return {
+        "ip": ip,
+        "hostname": hostname,
+        "class": ip_class(address),
+        "private": address.is_private,
+        "responsive": bool(open_ports),
+        "open_ports": open_ports,
+    }
+
+
+def scan_network(cidr: str, ports: list[int]) -> dict[str, Any]:
+    global scan_progress
+    network = ipaddress.ip_network(cidr, strict=False)
+    if network.version != 4:
+        raise ValueError("Only IPv4 LAN ranges are supported")
+    hosts = list(network.hosts())
+    if len(hosts) > MAX_HOSTS:
+        raise ValueError(f"The scan is limited to {MAX_HOSTS} hosts")
+
+    started = datetime.now(timezone.utc)
+    with scan_progress_lock:
+        scan_progress = {"active": True, "checked": 0, "total": len(hosts), "discovered": []}
+    results = []
+    for address in hosts:
+        result = scan_host(address, ports)
+        results.append(result)
+        with scan_progress_lock:
+            scan_progress["checked"] += 1
+            if result["responsive"]:
+                scan_progress["discovered"].append({
+                    "ip": result["ip"],
+                    "hostname": result["hostname"],
+                    "open_ports": result["open_ports"],
+                })
+    responsive = [result for result in results if result["responsive"]]
+    with scan_progress_lock:
+        scan_progress["active"] = False
+    return {
+        "scan_id": started.strftime("%Y%m%d-%H%M%S"),
+        "started_at": started.isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "network": str(network),
+        "host_count": len(hosts),
+        "ports": ports,
+        "attempted": len(hosts) * len(ports),
+        "responsive_count": len(responsive),
+        "results": responsive,
+    }
+
+
+@app.get("/")
+def index():
+    return render_template("index.html", default_network=local_network(), common_ports=COMMON_PORTS)
+
+
+@app.get("/reports")
+def reports():
+    return render_template("reports.html")
+
+
+@app.post("/api/scan")
+def run_scan():
+    payload = request.get_json(silent=True) or {}
+    cidr = str(payload.get("network", local_network())).strip()
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        ports = parse_ports(str(payload.get("ports", "22,80,443,8080")))
+        report = scan_network(str(network), ports)
+        return jsonify(report)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.get("/api/scan/status")
+def scan_status():
+    with scan_progress_lock:
+        return jsonify(scan_progress)
+
+
+@app.post("/api/report")
+def download_report():
+    payload = request.get_json(silent=True) or {}
+    report_text = json.dumps(payload, indent=2)
+    report_name = f"lan-scan-{payload.get('scan_id', 'report')}.json"
+    return send_file(
+        BytesIO(report_text.encode("utf-8")),
+        mimetype="application/json",
+        as_attachment=True,
+        download_name=report_name,
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="127.0.0.1", port=5000)
